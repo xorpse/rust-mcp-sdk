@@ -40,6 +40,64 @@ pub fn is_vec(ty: &Type) -> bool {
 }
 
 #[allow(unused)]
+pub fn is_hash_map(ty: &Type) -> bool {
+    if let Type::Path(type_path) = ty {
+        if type_path.path.segments.len() == 1 {
+            let segment = &type_path.path.segments[0];
+            return segment.ident == "HashMap"
+                && matches!(segment.arguments, PathArguments::AngleBracketed(_));
+        }
+    }
+    false
+}
+
+#[allow(unused)]
+pub fn is_btree_map(ty: &Type) -> bool {
+    if let Type::Path(type_path) = ty {
+        if type_path.path.segments.len() == 1 {
+            let segment = &type_path.path.segments[0];
+            return segment.ident == "BTreeMap"
+                && matches!(segment.arguments, PathArguments::AngleBracketed(_));
+        }
+    }
+    false
+}
+
+#[allow(unused)]
+pub fn map_key_value_types(ty: &Type) -> Option<(&Type, &Type)> {
+    if let Type::Path(type_path) = ty {
+        if type_path.path.segments.len() == 1 {
+            let segment = &type_path.path.segments[0];
+            if (segment.ident == "HashMap" || segment.ident == "BTreeMap")
+                && matches!(segment.arguments, PathArguments::AngleBracketed(_))
+            {
+                if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if args.args.len() == 2 {
+                        if let (
+                            syn::GenericArgument::Type(key_ty),
+                            syn::GenericArgument::Type(value_ty),
+                        ) = (&args.args[0], &args.args[1])
+                        {
+                            return Some((key_ty, value_ty));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_string_type(ty: &Type) -> bool {
+    if let Type::Path(type_path) = ty {
+        if type_path.path.segments.len() == 1 {
+            return type_path.path.segments[0].ident == "String";
+        }
+    }
+    false
+}
+
+#[allow(unused)]
 // Extract the inner type from Vec<T> or Option<T>
 pub fn inner_type(ty: &Type) -> Option<&Type> {
     if let Type::Path(type_path) = ty {
@@ -85,7 +143,7 @@ pub fn might_be_struct(ty: &Type) -> bool {
             let ident = type_path.path.segments[0].ident.to_string();
             let common_types = vec![
                 "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "f32", "f64",
-                "bool", "char", "str", "String", "Vec", "Option",
+                "bool", "char", "str", "String", "Vec", "Option", "HashMap", "BTreeMap",
             ];
             return !common_types.contains(&ident.as_str())
                 && type_path.path.segments[0].arguments.is_empty();
@@ -322,7 +380,32 @@ pub fn type_to_json_schema(ty: &Type, attrs: &[Attribute]) -> proc_macro2::Token
                         }
                     }
                 }
-                //  Handle imported serde_json::Number (single-segment case, common when `use serde_json::Number;`)
+                else if ident == "HashMap" || ident == "BTreeMap" {
+                    if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                        if args.args.len() == 2 {
+                            if let (
+                                syn::GenericArgument::Type(key_ty),
+                                syn::GenericArgument::Type(value_ty),
+                            ) = (&args.args[0], &args.args[1])
+                            {
+                                if is_string_type(key_ty) {
+                                    let value_schema = type_to_json_schema(value_ty, &[]);
+                                    return quote! {
+                                        {
+                                            let mut map = serde_json::Map::new();
+                                            map.insert("type".to_owned(), serde_json::Value::String("object".to_owned()));
+                                            map.insert("additionalProperties".to_owned(), serde_json::Value::Object(#value_schema));
+                                            #description_quote
+                                            #title_quote
+                                            #default_quote
+                                            map
+                                        }
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
                 else if ident == "Number" {
                     let min_num_quote = minimum.as_ref().map(|min| {
                                         quote! {
@@ -486,8 +569,43 @@ pub fn type_to_json_schema(ty: &Type, attrs: &[Attribute]) -> proc_macro2::Token
                         }
                     };
                 }
+            } else if type_path.path.segments.len() == 3 {
+                let segments: Vec<_> = type_path.path.segments.iter().collect();
+                let seg0 = &segments[0];
+                let seg1 = &segments[1];
+                let seg2 = &segments[2];
+                if seg0.ident == "std"
+                    && seg0.arguments.is_empty()
+                    && seg1.ident == "collections"
+                    && seg1.arguments.is_empty()
+                    && (seg2.ident == "HashMap" || seg2.ident == "BTreeMap")
+                {
+                    if let PathArguments::AngleBracketed(args) = &seg2.arguments {
+                        if args.args.len() == 2 {
+                            if let (
+                                syn::GenericArgument::Type(key_ty),
+                                syn::GenericArgument::Type(value_ty),
+                            ) = (&args.args[0], &args.args[1])
+                            {
+                                if is_string_type(key_ty) {
+                                    let value_schema = type_to_json_schema(value_ty, &[]);
+                                    return quote! {
+                                        {
+                                            let mut map = serde_json::Map::new();
+                                            map.insert("type".to_owned(), serde_json::Value::String("object".to_owned()));
+                                            map.insert("additionalProperties".to_owned(), serde_json::Value::Object(#value_schema));
+                                            #description_quote
+                                            #title_quote
+                                            #default_quote
+                                            map
+                                        }
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            // Fallback for unknown types
             quote! {
                 {
                     let mut map = serde_json::Map::new();
@@ -894,6 +1012,130 @@ mod tests {
     #[test]
     fn test_json_schema_fallback_unknown() {
         let ty: syn::Type = parse_quote!((i32, i32));
+        let tokens = type_to_json_schema(&ty, &[]);
+        let output = render(tokens);
+        assert!(output
+            .contains("\"type\".to_string(),serde_json::Value::String(\"unknown\".to_string())"));
+    }
+
+    #[test]
+    fn test_is_hash_map() {
+        let ty: Type = parse_quote!(HashMap<String, i32>);
+        assert!(is_hash_map(&ty));
+
+        let ty: Type = parse_quote!(Vec<String>);
+        assert!(!is_hash_map(&ty));
+
+        let ty: Type = parse_quote!(BTreeMap<String, i32>);
+        assert!(!is_hash_map(&ty));
+    }
+
+    #[test]
+    fn test_is_btree_map() {
+        let ty: Type = parse_quote!(BTreeMap<String, i32>);
+        assert!(is_btree_map(&ty));
+
+        let ty: Type = parse_quote!(Vec<String>);
+        assert!(!is_btree_map(&ty));
+
+        let ty: Type = parse_quote!(HashMap<String, i32>);
+        assert!(!is_btree_map(&ty));
+    }
+
+    #[test]
+    fn test_map_key_value_types() {
+        let ty: Type = parse_quote!(HashMap<String, i32>);
+        let result = map_key_value_types(&ty);
+        assert!(result.is_some());
+        let (key, value) = result.unwrap();
+        assert_eq!(quote!(#key).to_string(), quote!(String).to_string());
+        assert_eq!(quote!(#value).to_string(), quote!(i32).to_string());
+
+        let ty: Type = parse_quote!(BTreeMap<String, Vec<u8>>);
+        let result = map_key_value_types(&ty);
+        assert!(result.is_some());
+        let (key, value) = result.unwrap();
+        assert_eq!(quote!(#key).to_string(), quote!(String).to_string());
+        assert_eq!(quote!(#value).to_string(), quote!(Vec < u8 >).to_string());
+
+        let ty: Type = parse_quote!(Vec<String>);
+        assert!(map_key_value_types(&ty).is_none());
+    }
+
+    #[test]
+    fn test_json_schema_hash_map() {
+        let ty: syn::Type = parse_quote!(HashMap<String, i32>);
+        let tokens = type_to_json_schema(&ty, &[]);
+        let output = render(tokens);
+        assert!(output
+            .contains("\"type\".to_owned(),serde_json::Value::String(\"object\".to_owned())"));
+        assert!(output.contains("\"additionalProperties\".to_owned(),serde_json::Value::Object"));
+        assert!(output
+            .contains("\"type\".to_string(),serde_json::Value::String(\"integer\".to_string())"));
+    }
+
+    #[test]
+    fn test_json_schema_btree_map() {
+        let ty: syn::Type = parse_quote!(BTreeMap<String, bool>);
+        let tokens = type_to_json_schema(&ty, &[]);
+        let output = render(tokens);
+        assert!(output
+            .contains("\"type\".to_owned(),serde_json::Value::String(\"object\".to_owned())"));
+        assert!(output.contains("\"additionalProperties\".to_owned(),serde_json::Value::Object"));
+        assert!(output
+            .contains("\"type\".to_string(),serde_json::Value::String(\"boolean\".to_string())"));
+    }
+
+    #[test]
+    fn test_json_schema_hash_map_fully_qualified() {
+        let ty: syn::Type = parse_quote!(std::collections::HashMap<String, f64>);
+        let tokens = type_to_json_schema(&ty, &[]);
+        let output = render(tokens);
+        assert!(output
+            .contains("\"type\".to_owned(),serde_json::Value::String(\"object\".to_owned())"));
+        assert!(output.contains("\"additionalProperties\".to_owned(),serde_json::Value::Object"));
+        assert!(output
+            .contains("\"type\".to_string(),serde_json::Value::String(\"number\".to_string())"));
+    }
+
+    #[test]
+    fn test_json_schema_btree_map_fully_qualified() {
+        let ty: syn::Type = parse_quote!(std::collections::BTreeMap<String, String>);
+        let tokens = type_to_json_schema(&ty, &[]);
+        let output = render(tokens);
+        assert!(output
+            .contains("\"type\".to_owned(),serde_json::Value::String(\"object\".to_owned())"));
+        assert!(output.contains("\"additionalProperties\".to_owned(),serde_json::Value::Object"));
+        assert!(output
+            .contains("\"type\".to_string(),serde_json::Value::String(\"string\".to_string())"));
+    }
+
+    #[test]
+    fn test_json_schema_nested_map_value() {
+        let ty: syn::Type = parse_quote!(HashMap<String, Vec<i32>>);
+        let tokens = type_to_json_schema(&ty, &[]);
+        let output = render(tokens);
+        assert!(output
+            .contains("\"type\".to_owned(),serde_json::Value::String(\"object\".to_owned())"));
+        assert!(output.contains("\"additionalProperties\".to_owned(),serde_json::Value::Object"));
+        assert!(output
+            .contains("\"type\".to_string(),serde_json::Value::String(\"array\".to_string())"));
+    }
+
+    #[test]
+    fn test_json_schema_option_hash_map() {
+        let ty: syn::Type = parse_quote!(Option<HashMap<String, i32>>);
+        let tokens = type_to_json_schema(&ty, &[]);
+        let output = render(tokens);
+        assert!(output.contains("\"nullable\".to_string(),serde_json::Value::Bool(true)"));
+        assert!(output
+            .contains("\"type\".to_owned(),serde_json::Value::String(\"object\".to_owned())"));
+        assert!(output.contains("\"additionalProperties\".to_owned(),serde_json::Value::Object"));
+    }
+
+    #[test]
+    fn test_json_schema_hash_map_non_string_key() {
+        let ty: syn::Type = parse_quote!(HashMap<i32, String>);
         let tokens = type_to_json_schema(&ty, &[]);
         let output = render(tokens);
         assert!(output
